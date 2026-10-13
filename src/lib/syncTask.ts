@@ -10,10 +10,12 @@
  *   items    all listings concatenated (`fromEach`), deduped against storage
  *            keys synced/{fileId}:{etag} — the ETag IS the change cursor, so
  *            unchanged files never transfer twice and edited files re-sync
- *   steps    skip non-document types / oversized files → delete the previous
- *            Cortex document if the file changed → binary passthrough upload
- *            (server-side WebDAV GET → Cortex upload, bytes never touch the
- *            browser or the step context) → record docmap + synced marker
+ *   steps    skip non-document types / oversized files → binary passthrough
+ *            upload (server-side WebDAV GET → Cortex upload, bytes never touch
+ *            the browser or the step context) that REPLACES the file's
+ *            existing Cortex document in place (source_key +
+ *            replace_document_id from docmap — same document id, only the
+ *            changed parts are re-extracted) → record docmap + synced marker
  *
  * Submit it once with a schedule and the sync runs forever, headless —
  * the browser tab is just a dashboard.
@@ -84,6 +86,22 @@ function encodePath(path: string): string {
   return path.split("/").filter(Boolean).map(encodeURIComponent).join("/");
 }
 
+/** Old backends (no in-place replace) answer an upload without a "replaced"
+ * field and mint a new document — then remove the superseded one, exactly
+ * like the pre-replace delete-then-upload flow did. */
+const REPLACE_FALLBACK_STEPS = [
+  {
+    cortex: { method: "DELETE", path: "documents/{prev.value.docId}" },
+    when: {
+      and: [
+        { notEmpty: "$prev.value.docId" },
+        { eq: ["{up.body.replaced}", ""] },
+        { neq: ["{up.body.document_id}", "{prev.value.docId}"] },
+      ],
+    },
+  },
+];
+
 export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
   const base = opts.baseUrl.replace(/\/+$/, "");
   const uploadParams = new URLSearchParams({
@@ -91,6 +109,12 @@ export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
     source: "nextcloud-sync",
   });
   if (opts.collectionId) uploadParams.set("collection_id", opts.collectionId);
+  // stable per-server identity: fileIds are only unique within one server
+  const sourceKeyPrefix = encodeURIComponent(`nextcloud:${base}${opts.davRootPath}:`);
+  const uploadPath =
+    `upload?${uploadParams.toString()}` +
+    `&source_key=${sourceKeyPrefix}{vars.fileId|urlencode}` +
+    `&replace_document_id={prev.value.docId|urlencode}`;
 
   const listingSteps = opts.folders.map((folder, i) => ({
     id: `f${i}`,
@@ -144,29 +168,25 @@ export function buildSyncTask(opts: SyncTaskOptions): Record<string, unknown> {
       },
       // previous sync state for this file (rename/edit tracking by fileId)
       { id: "prev", store: { get: "docmap/{vars.fileId}" } },
-      // the file changed → replace, don't duplicate: delete the old document
-      {
-        cortex: { method: "DELETE", path: "documents/{prev.value.docId}" },
-        when: {
-          and: [
-            { found: "$prev.value" },
-            { notEmpty: "$prev.value.docId" },
-            { neq: ["$prev.value.etag", "{vars.etag}"] },
-          ],
-        },
-      },
-      // binary passthrough: server-side WebDAV GET → Cortex upload
+      // binary passthrough: server-side WebDAV GET → Cortex upload. A changed
+      // file REPLACES its document in place (same id — Cortex re-extracts
+      // only what changed): source_key finds it, replace_document_id adopts
+      // documents synced before source keys existed. Empty when new.
       {
         id: "up",
         cortex: {
           method: "POST",
-          path: `upload?${uploadParams.toString()}`,
+          path: uploadPath,
           multipart: {
             fromUrl: "{config.NEXTCLOUD_BASE_URL}{vars.href}",
             filename: "nextcloud-{vars.fileId}-{vars.name}",
           },
         },
       },
+      // compatibility: a Cortex backend without in-place replace ignores the
+      // replace params and creates a new document (its response has no
+      // "replaced" field) — delete the previous one as older app versions did
+      ...REPLACE_FALLBACK_STEPS,
       {
         store: {
           put: "docmap/{vars.fileId}",

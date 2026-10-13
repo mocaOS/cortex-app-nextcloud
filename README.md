@@ -45,12 +45,16 @@ executes in its own async loop:
 - **per file** (2 in flight, per-item error isolation) — the listings are
   concatenated and deduped against app storage: `synced/{fileId}:{etag}`
   means the ETag *is* the change cursor. For each new or changed file:
-  skip non-document MIME types (optional) and files over ~19 MB → if the
-  file changed, delete its previous Cortex document (`docmap/{fileId}`
-  remembers the document id) → **binary passthrough upload**: Cortex fetches
-  the file from WebDAV and streams it straight into `POST /api/upload`
-  (`source=nextcloud-sync`) — the bytes never touch a browser → record the
-  new state in storage.
+  skip non-document MIME types (optional) and files over ~19 MB →
+  **binary passthrough upload**: Cortex fetches the file from WebDAV and
+  streams it straight into `POST /api/upload` (`source=nextcloud-sync`) —
+  the bytes never touch a browser → record the new state in storage.
+  Edited files **replace their Cortex document in place**: the upload
+  carries a stable `source_key` plus the previous document id
+  (`docmap/{fileId}`), so the document keeps its id and Cortex re-extracts
+  only the parts that changed. On a Cortex backend without in-place
+  replace, the app falls back to the old behaviour (new document, then
+  the previous one is deleted).
 
 With a schedule (`every hour` / `6 hours` / `daily`), Cortex re-runs the
 task on its own. The app UI is just a dashboard: live progress, pause /
@@ -62,8 +66,8 @@ entity extraction) on each file — watch progress on the Documents page.
 ### v1 limitations
 
 - Deleting a file in Nextcloud does **not** delete it in Cortex.
-- Renames re-sync under the new name (same content, new document filename);
-  the old document is replaced, not duplicated.
+- Renames re-sync under the new name (same content); the existing document
+  is replaced in place, not duplicated.
 - New sub-folders under a synced root are discovered when the task is
   re-submitted (any **Sync now** / settings change), not mid-schedule.
 - Files larger than ~19 MB are skipped (platform transfer cap).
@@ -71,7 +75,8 @@ entity extraction) on each file — watch progress on the Documents page.
 
 ## Manifest notes
 
-- `keyScope: read_write` — uploads and replace-on-change deletes need MANAGE
+- `keyScope: read_write` — uploads (and the old-backend replace fallback's
+  deletes) need MANAGE
 - `endpoints: ["upload", "documents", "collections"]` — everything else 403s
 - `capabilities: http` (WebDAV calls, host-allowlisted to
   `${NEXTCLOUD_BASE_URL}`, Basic auth injected server-side), `tasks` (the
